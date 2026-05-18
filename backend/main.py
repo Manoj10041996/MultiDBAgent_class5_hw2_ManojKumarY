@@ -3,17 +3,31 @@ main.py — FastAPI application entry point for StockPulse Intelligence Agent.
 
 Single endpoint: POST /chat
 Accepts a question, runs the ReAct agent, returns answer + tool trace.
+
+The agent (langgraph.prebuilt.create_react_agent) returns a state dict with a
+'messages' list instead of the old 'intermediate_steps'. This file parses that
+messages list to reconstruct the full tool-call trace required by the SPEC.
+
+Message types in the result:
+  HumanMessage  — the original question
+  AIMessage     — LLM reasoning step; .tool_calls list signals which tools to call
+  ToolMessage   — result of one tool call; .tool_call_id links back to AIMessage
+  AIMessage     — final answer (last AIMessage, no .tool_calls)
 """
 
+import json
+import re
 import time
 from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from langchain_core.messages import AIMessage, ToolMessage
 from pydantic import BaseModel, Field
 
-from backend.agent import agent_executor
+from backend.agent import agent
+from backend.config import settings
 
 # ---------------------------------------------------------------------------
 # Pydantic models — API contract
@@ -21,8 +35,10 @@ from backend.agent import agent_executor
 
 
 class ChatRequest(BaseModel):
-    question: str = Field(..., min_length=1, max_length=1000,
-                          description="Natural language question from the store manager")
+    question: str = Field(
+        ..., min_length=1, max_length=1000,
+        description="Natural language question from the store manager",
+    )
 
 
 class ToolCallRecord(BaseModel):
@@ -51,7 +67,7 @@ class ChatResponse(BaseModel):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # agent_executor is a module-level singleton — already initialised on import
+    # agent is a module-level singleton — already initialised on import
     yield
 
 
@@ -75,41 +91,115 @@ app.add_middleware(
 
 
 # ---------------------------------------------------------------------------
-# Helper: extract tool-call trace from LangChain intermediate steps
+# Helper: extract tool-call trace from LangGraph messages list
 # ---------------------------------------------------------------------------
 
 
-def _extract_tool_calls(intermediate_steps: list) -> tuple[list[ToolCallRecord], list[str]]:
+def _extract_tool_calls(messages: list) -> tuple[list[ToolCallRecord], list[str]]:
     """
-    Parses LangChain's intermediate_steps list into ToolCallRecord objects.
+    Parses the LangGraph messages list into ToolCallRecord objects.
 
-    intermediate_steps is a list of (AgentAction, observation_str) tuples.
+    The new create_react_agent returns a 'messages' list where:
+      - AIMessage with .tool_calls  →  the LLM decided to call a tool
+      - ToolMessage                 →  the actual tool result (.tool_call_id links back)
+
+    We build a lookup of tool_call_id → ToolMessage, then walk AIMessages
+    to reconstruct each (tool_name, args, result) triple in call order.
     """
+    # Index all ToolMessages by their tool_call_id for O(1) lookup
+    tool_results: dict[str, str] = {}
+    for msg in messages:
+        if isinstance(msg, ToolMessage):
+            tool_results[msg.tool_call_id] = str(msg.content)
+
     records: list[ToolCallRecord] = []
-    warnings: list[str] = []
+    provisional_warnings: list[tuple[int, str, str]] = []
+    success_indices_by_tool: dict[str, list[int]] = {}
 
-    for action, observation in intermediate_steps:
-        tool_name = action.tool
-        tool_input = action.tool_input
-        result_str = str(observation)
-
-        records.append(
-            ToolCallRecord(
-                tool=tool_name,
-                args=tool_input,
-                result=result_str,
-            )
-        )
-
-        # Surface soft errors as warnings
+    def _warning_message(tool_name: str, result_str: str) -> str | None:
         if result_str.startswith("REFUSED:"):
-            warnings.append(f"[{tool_name}] {result_str}")
-        elif result_str.startswith("SQL ERROR:") or result_str.startswith("MONGO ERROR:") or result_str.startswith("SEARCH ERROR:"):
-            warnings.append(f"[{tool_name}] {result_str}")
-        elif result_str in ("[]", "null", ""):
-            warnings.append(f"[{tool_name}] returned no results")
+            return f"[{tool_name}] {result_str}"
+        if any(result_str.startswith(p) for p in ("SQL ERROR:", "MONGO ERROR:", "SEARCH ERROR:")):
+            return f"[{tool_name}] {result_str}"
+        if result_str in ("[]", "null", ""):
+            return f"[{tool_name}] returned no results"
+        return None
 
-    return records, warnings
+    def _is_successful_result(result_str: str) -> bool:
+        if result_str in ("", "[]", "null", "(no result captured)"):
+            return False
+        if result_str.startswith("REFUSED:"):
+            return False
+        if any(result_str.startswith(p) for p in ("SQL ERROR:", "MONGO ERROR:", "SEARCH ERROR:")):
+            return False
+        return True
+
+    for msg in messages:
+        if not isinstance(msg, AIMessage):
+            continue
+        if not msg.tool_calls:
+            continue
+
+        for tc in msg.tool_calls:
+            tool_name = tc["name"]
+            tool_args = tc.get("args", {})
+            call_id   = tc.get("id", "")
+            result_str = tool_results.get(call_id, "(no result captured)")
+
+            records.append(ToolCallRecord(
+                tool=tool_name,
+                args=tool_args,
+                result=result_str,
+            ))
+
+            record_index = len(records) - 1
+            warning = _warning_message(tool_name, result_str)
+            if warning:
+                provisional_warnings.append((record_index, tool_name, warning))
+            elif _is_successful_result(result_str):
+                success_indices_by_tool.setdefault(tool_name, []).append(record_index)
+
+    final_warnings: list[str] = []
+    for warning_index, tool_name, warning_message in provisional_warnings:
+        success_indices = success_indices_by_tool.get(tool_name, [])
+        recovered_later = any(success_index > warning_index for success_index in success_indices)
+        if not recovered_later:
+            final_warnings.append(warning_message)
+
+    return records, final_warnings
+
+
+def _get_final_answer(messages: list) -> str:
+    """
+    Returns the content of the last AIMessage that has no tool_calls
+    (i.e., the final grounded answer, not a reasoning step).
+    """
+    for msg in reversed(messages):
+        if isinstance(msg, AIMessage) and not msg.tool_calls:
+            content = msg.content
+            if isinstance(content, str):
+                return content
+            # Some LLMs return a list of content blocks
+            if isinstance(content, list):
+                return " ".join(
+                    block.get("text", "") if isinstance(block, dict) else str(block)
+                    for block in content
+                )
+    return "No answer produced."
+
+
+def _normalize_answer_text(answer: str) -> str:
+    """
+    Converts markdown-like list formatting into plain chatbot text.
+    """
+    cleaned_lines: list[str] = []
+    for raw_line in answer.splitlines():
+        line = re.sub(r"^\s*[*-]\s+", "", raw_line).strip()
+        if line:
+            cleaned_lines.append(line)
+    if not cleaned_lines:
+        return answer.strip()
+    return " ".join(cleaned_lines)
 
 
 # ---------------------------------------------------------------------------
@@ -122,13 +212,16 @@ async def chat(request: ChatRequest) -> ChatResponse:
     """
     Submit a natural-language question to the StockPulse agent.
 
-    The agent will select the appropriate tool(s), query the relevant database,
-    and return a grounded answer with full tool-call traceability.
+    The agent selects the appropriate tool(s), queries the relevant database,
+    and returns a grounded answer with full tool-call traceability.
     """
     start_ms = time.time()
 
     try:
-        result = agent_executor.invoke({"input": request.question})
+        result = agent.invoke(
+            {"messages": [("user", request.question)]},
+            config={"recursion_limit": settings.agent_max_iterations * 2 + 2},
+        )
     except Exception as exc:
         raise HTTPException(
             status_code=500,
@@ -137,15 +230,14 @@ async def chat(request: ChatRequest) -> ChatResponse:
 
     elapsed_ms = int((time.time() - start_ms) * 1000)
 
-    answer: str = result.get("output", "No answer produced.")
-    intermediate_steps: list = result.get("intermediate_steps", [])
-
-    tool_calls, warnings = _extract_tool_calls(intermediate_steps)
+    messages = result.get("messages", [])
+    answer = _normalize_answer_text(_get_final_answer(messages))
+    tool_calls, api_warnings = _extract_tool_calls(messages)
 
     return ChatResponse(
         answer=answer,
         tool_calls=tool_calls,
-        warnings=warnings,
+        warnings=api_warnings,
         elapsed_ms=elapsed_ms,
     )
 

@@ -9,32 +9,22 @@ dependencies = [
     # Web framework
     "fastapi>=0.111.0",
     "uvicorn[standard]>=0.29.0",
-
     # LangChain v1 ReAct agent
     "langchain>=0.2.0",
     "langchain-groq>=0.1.6",       # Groq integration for ChatGroq
     "langchain-core>=0.2.0",
-
     # Groq SDK (underlying client for langchain-groq)
     "groq>=0.9.0",
-
     # Local embeddings — no API key needed
     "sentence-transformers>=3.0.0",
     "torch>=2.0.0",                # SentenceTransformers backend
-
     # Postgres driver + pgvector
     "psycopg2-binary>=2.9.9",
-
     # MongoDB driver
     "pymongo>=4.7.0",
-
     # Pydantic (FastAPI + Settings)
     "pydantic>=2.7.0",
     "pydantic-settings>=2.3.0",
-
-    # BSON (ObjectId serialization for pymongo)
-    "bson>=0.5.10",
-
     # Environment loading for scripts
     "python-dotenv>=1.0.1",
 ]
