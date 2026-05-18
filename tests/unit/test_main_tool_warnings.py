@@ -1,10 +1,8 @@
-"""
-Unit tests for warning extraction logic in backend.main._extract_tool_calls.
-"""
+"""Unit tests for warning extraction logic in backend.api.message_parser."""
 
 from langchain_core.messages import AIMessage, ToolMessage
 
-from backend.main import _extract_tool_calls
+from backend.api.message_parser import extract_tool_calls
 
 
 def test_suppresses_sql_warning_when_later_sql_call_succeeds():
@@ -38,7 +36,7 @@ def test_suppresses_sql_warning_when_later_sql_call_succeeds():
         AIMessage(content="Final answer"),
     ]
 
-    records, warnings = _extract_tool_calls(messages)
+    records, warnings = extract_tool_calls(messages)
 
     assert len(records) == 2
     assert warnings == []
@@ -62,7 +60,7 @@ def test_keeps_warning_when_sql_error_is_not_recovered():
         AIMessage(content="I could not retrieve the data."),
     ]
 
-    _, warnings = _extract_tool_calls(messages)
+    _, warnings = extract_tool_calls(messages)
 
     assert len(warnings) == 1
     assert "SQL ERROR" in warnings[0]
