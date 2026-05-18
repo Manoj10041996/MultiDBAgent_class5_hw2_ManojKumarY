@@ -20,10 +20,11 @@ export function useChatSession() {
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const lastQuestionRef = useRef<string | null>(null);
+  const inFlightRef = useRef(false);
 
   const submitQuestion = useCallback(
     async (questionOverride?: string, options?: SubmitOptions) => {
-      if (isLoading) {
+      if (isLoading || inFlightRef.current) {
         return;
       }
 
@@ -32,6 +33,7 @@ export function useChatSession() {
         return;
       }
 
+      inFlightRef.current = true;
       lastQuestionRef.current = question;
       if (!options?.skipUserMessage) {
         setMessages((prev) => [
@@ -64,6 +66,7 @@ export function useChatSession() {
       } catch (err) {
         setError(err instanceof Error ? err.message : 'Something went wrong');
       } finally {
+        inFlightRef.current = false;
         setIsLoading(false);
       }
     },
@@ -83,6 +86,7 @@ export function useChatSession() {
     setInput('');
     setError(null);
     setIsLoading(false);
+    inFlightRef.current = false;
     lastQuestionRef.current = null;
   }, []);
 
