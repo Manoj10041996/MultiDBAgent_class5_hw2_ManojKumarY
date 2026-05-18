@@ -27,6 +27,7 @@ dependencies = [
     "pydantic-settings>=2.3.0",
     # Environment loading for scripts
     "python-dotenv>=1.0.1",
+    "pytest>=9.0.3",
 ]
 
 [project.optional-dependencies]

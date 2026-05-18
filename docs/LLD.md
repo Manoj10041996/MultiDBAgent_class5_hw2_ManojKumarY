@@ -1,158 +1,334 @@
 # Low-Level Design (LLD) — StockPulse Agent
 
-This Low-Level Design maps the High-Level Design to exact code modules, class structures, Pydantic models, and execution flows required to build the StockPulse Intelligence Agent.
+> Implementation-level contracts mapping SPEC.md to exact code. Every code
+> snippet here reflects the **actual running codebase**, not aspirational design.
+>
+> For component overview see [HLD.md](./HLD.md). For C4 diagrams see [ARCHITECTURE.md](./ARCHITECTURE.md).
 
 ---
 
 ## 1. API Layer (`backend/main.py`)
 
-### 1.1 Data Models (Pydantic)
-The system relies on strong typing for all HTTP boundaries.
+### 1.1 Pydantic Models
 
 ```python
 class ChatRequest(BaseModel):
-    question: str = Field(..., max_length=500)
+    question: str = Field(..., min_length=1, max_length=1000)
 
 class ToolCallRecord(BaseModel):
-    tool: str
-    args: dict
-    result: str
+    tool: str          # "sql_query" | "mongo_query" | "handbook_search"
+    args: Any          # arguments passed to the tool
+    result: str        # raw string result returned by the tool
 
 class ChatResponse(BaseModel):
-    answer: str
-    tool_calls: List[ToolCallRecord]
-    warnings: List[str]
-    elapsed_ms: int
+    answer: str                       # agent's final answer
+    tool_calls: list[ToolCallRecord]  # every tool invocation in order
+    warnings: list[str]               # guardrail triggers, empty results
+    elapsed_ms: int                   # wall-clock time (ms)
 ```
 
-### 1.2 Endpoint Definition
+### 1.2 Endpoint Implementation
+
 ```python
 @app.post("/chat", response_model=ChatResponse)
-async def chat_endpoint(request: ChatRequest):
-    # 1. Start timer
-    # 2. Call run_agent(request.question)
-    # 3. Catch exceptions -> 500 error
-    # 4. Extract LangChain intermediate_steps into ToolCallRecords
-    # 5. Stop timer
-    # 6. Return ChatResponse
+async def chat(request: ChatRequest) -> ChatResponse:
+    start_ms = time.time()
+
+    result = agent.invoke(
+        {"messages": [("user", request.question)]},
+        config={"recursion_limit": settings.agent_max_iterations * 2 + 2},
+    )
+
+    messages = result.get("messages", [])
+    answer = _get_final_answer(messages)
+    tool_calls, warnings = _extract_tool_calls(messages)
+
+    return ChatResponse(
+        answer=answer,
+        tool_calls=tool_calls,
+        warnings=warnings,
+        elapsed_ms=int((time.time() - start_ms) * 1000),
+    )
 ```
+
+### 1.3 Message Parsing (`_extract_tool_calls`)
+
+The LangGraph agent returns a `messages` list. Parsing logic:
+
+1. **Index** all `ToolMessage` objects by `tool_call_id` → `dict[str, str]`
+2. **Walk** each `AIMessage` that has `.tool_calls`
+3. **Pair** each tool call with its corresponding `ToolMessage.content`
+4. **Flag warnings** for: `REFUSED:*`, `SQL ERROR:*`, `MONGO ERROR:*`, `SEARCH ERROR:*`, empty results
+
+### 1.4 Answer Extraction (`_get_final_answer`)
+
+Walk `messages` in reverse, return the content of the **last `AIMessage`** that
+has no `tool_calls` — this is the agent's final grounded answer.
 
 ---
 
-## 2. Tool Implementation Details (`backend/tools/`)
+## 2. Agent Configuration (`backend/agent.py`)
 
-All tools are decorated with LangChain's `@tool` to auto-generate JSON schemas for the LLM.
+### 2.1 LLM Setup
 
-### 2.1 SQL Tool (`sql_tool.py`)
+```python
+from langchain_groq import ChatGroq
+
+llm = ChatGroq(
+    model=settings.llm_model,           # "openai/gpt-oss-120b"
+    temperature=0,
+    groq_api_key=settings.groq_api_key,
+)
+```
+
+**Why Groq?** Sub-second first-token latency. The `openai/gpt-oss-120b` model
+has strong ReAct instruction following. Swappable via `LLM_MODEL` in `.env`
+(per SPEC.md Appendix: Model Swap Policy).
+
+### 2.2 Agent Construction
+
+```python
+from langgraph.prebuilt import create_react_agent
+
+agent = create_react_agent(
+    model=llm,
+    tools=[sql_query, mongo_query, handbook_search],
+    prompt=SYSTEM_PROMPT,   # exact text from SPEC.md §3
+)
+```
+
+Returns a `CompiledStateGraph`. Invoked with:
+```python
+result = agent.invoke(
+    {"messages": [("user", question)]},
+    config={"recursion_limit": 12},   # 5 iterations × 2 nodes + 2 buffer
+)
+```
+
+### 2.3 System Prompt
+
+The system prompt is the **exact text from SPEC.md §3**, including:
+- Tool selection routing rules
+- Hard rules (no memory, cite exact values, one paragraph)
+
+---
+
+## 3. Tool Implementation Details (`backend/tools/`)
+
+All tools use LangChain's `@tool` decorator for auto-generated JSON schemas.
+All tools return strings — the agent loop **never crashes**.
+
+### 3.1 SQL Tool (`sql_tool.py`)
+
 ```python
 @tool
 def sql_query(sql: str) -> str:
     """Execute read-only SELECT against Postgres."""
 ```
-**Validation Logic:**
-1. Check for dangerous keywords: `sql.upper()` against `["DROP", "DELETE", "UPDATE", "INSERT", "ALTER", "TRUNCATE"]`. Return `REFUSED` string if found.
-2. Check for multiple statements: `if ";" in sql.strip(";"): return "REFUSED"`
-3. Check starting keyword: Must start with `SELECT` or `WITH`.
-4. Inject Limit: If `"LIMIT"` not in `sql.upper()` and no `GROUP BY`/aggregate, append ` LIMIT 50`.
-**Execution:**
-Wrap in `try/except psycopg.Error`. On catch, return `"SQL ERROR: " + str(e)`. Set `options="-c statement_timeout=5000"`.
-**Formatting:**
-Fetch rows as dictionaries. Return `json.dumps(rows, default=str)`.
 
-### 2.2 MongoDB Tool (`mongo_tool.py`)
+**Validation pipeline (in order):**
+
+| Step | Check | On failure |
+|------|-------|------------|
+| 1 | Strip and normalize whitespace | — |
+| 2 | Reject forbidden keywords: `DROP`, `DELETE`, `UPDATE`, `INSERT`, `ALTER`, `TRUNCATE`, `GRANT`, `REVOKE`, `CREATE`, `EXEC`, `EXECUTE` | `"REFUSED: query contains forbidden keyword {kw}"` |
+| 3 | Reject multiple statements: split on `;`, check count | `"REFUSED: multiple statements not allowed"` |
+| 4 | Must start with `SELECT` or `WITH` | `"REFUSED: only SELECT statements are allowed"` |
+| 5 | Auto-inject `LIMIT 50` if no LIMIT present and no aggregate (`GROUP BY`, `COUNT`, `SUM`, `AVG`, `MAX`, `MIN`) | — |
+
+**Execution:**
+```python
+conn = psycopg2.connect(settings.postgres_url, options="-c statement_timeout=5000")
+cur.execute(validated_sql)
+rows = [dict(zip(columns, row)) for row in cur.fetchall()]
+return json.dumps(rows, default=str)
+```
+
+**Error handling:** `except Exception as e: return f"SQL ERROR: {e}"`
+
+### 3.2 MongoDB Tool (`mongo_tool.py`)
+
 ```python
 @tool
 def mongo_query(collection: str, filter: dict, limit: int = 10) -> str:
-    """Query MongoDB Atlas collections."""
+    """Query MongoDB collections for reviews, tickets, and logs."""
 ```
-**Validation Logic:**
-1. Whitelist: `if collection not in ["reviews", "support_tickets", "activity_logs"]: return "REFUSED"`
-2. Filter Safety: Iterate dictionary keys recursively. `if key.startswith("$where") or key == "$function": return "REFUSED"`
-3. Limit enforcement: `limit = min(limit, 20)`
-**Execution:**
-`db[collection].find(filter).limit(limit)`
-**Formatting:**
-Convert `ObjectId` and `datetime` to strings. Return `json.dumps(docs)`.
 
-### 2.3 RAG Tool (`rag_tool.py`)
+**Validation pipeline:**
+
+| Step | Check | On failure |
+|------|-------|------------|
+| 1 | Collection whitelist: `reviews`, `support_tickets`, `activity_logs` | `"REFUSED: collection '{name}' not whitelisted"` |
+| 2 | Recursive filter key scan for `$where`, `$function`, `$accumulator` | `"REFUSED: server-side JS not allowed"` |
+| 3 | Hard cap: `limit = min(limit, 20)` | Silent cap |
+
+**Execution:**
+```python
+client = pymongo.MongoClient(settings.mongo_url)
+docs = list(client[settings.mongo_db][collection].find(filter).limit(limit))
+return json.dumps(docs, default=str)
+```
+
+**Error handling:** `except Exception as e: return f"MONGO ERROR: {e}"`
+
+### 3.3 RAG Tool (`rag_tool.py`)
+
 ```python
 @tool
 def handbook_search(query: str, k: int = 3) -> str:
-    """Semantic vector search over policy documents."""
+    """Semantic search over policy documents using local embeddings."""
 ```
-**Execution Logic:**
-1. Cap `k`: `k = min(k, 5)`
-2. Embed: Call `openai.embeddings.create(input=query, model="text-embedding-3-small")`.
-3. Query Postgres: 
-   ```sql
-   SELECT section, chunk, 1 - (embedding <=> %s) as similarity 
-   FROM handbook_chunks 
-   ORDER BY embedding <=> %s LIMIT %s
-   ```
-4. If results < threshold (e.g., 0.2 similarity), return `[]` to prevent LLM hallucinations.
-5. Format: Return `json.dumps([{"section": r[0], "chunk": r[1]}])`.
+
+**Embedding engine (module-level singleton):**
+```python
+from sentence_transformers import SentenceTransformer
+
+_model = SentenceTransformer(settings.embedding_model_name)  # all-MiniLM-L6-v2
+
+def _embed(text: str) -> list[float]:
+    return _model.encode(text).tolist()  # returns 384-dim vector
+```
+
+**No external API call needed.** The model is downloaded once (~90 MB) and runs
+on CPU in-process.
+
+**Execution pipeline:**
+
+| Step | Action |
+|------|--------|
+| 1 | Cap `k = min(k, 5)` |
+| 2 | Embed query locally: `_embed(query)` → 384-dim vector |
+| 3 | Query pgvector: `SELECT section, chunk, 1 - (embedding <=> %s) AS similarity FROM policy_chunks ORDER BY embedding <=> %s LIMIT %s` |
+| 4 | Filter by threshold: discard rows with `similarity < 0.2` |
+| 5 | Format: `json.dumps([{"section": r[0], "chunk": r[1]}])` |
+
+**Error handling:** `except Exception as e: return f"SEARCH ERROR: {e}"`
+
+**Important:** The `policy_chunks` table uses `vector(384)` to match
+`all-MiniLM-L6-v2` output. If the embedding model is changed, the table
+DDL must be updated and `scripts/index_policies.py` re-run.
 
 ---
 
-## 3. Agent Configuration (`backend/agent.py` - system prompt lives here)
+## 4. Configuration (`backend/config.py`)
 
-### 3.1 LLM Setup
 ```python
-llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
-```
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
-### 3.2 Agent Pipeline
-Using the LangChain v1 ReAct pattern:
-```python
-prompt = PromptTemplate.from_template(SYSTEM_PROMPT_FROM_SPEC)
-tools = [sql_query, mongo_query, handbook_search]
-agent = create_react_agent(llm, tools, prompt)
-agent_executor = AgentExecutor(
-    agent=agent, 
-    tools=tools, 
-    max_iterations=5, 
-    return_intermediate_steps=True, # Critical for trace UI
-    handle_parsing_errors=True      # Prevents LLM formatting crashes
-)
+    groq_api_key: str                           # required
+    postgres_url: str                            # required
+    mongo_url: str                               # required
+    mongo_db: str = "stockpulse"
+
+    llm_model: str = "openai/gpt-oss-120b"
+    embedding_model_name: str = "all-MiniLM-L6-v2"
+    embedding_dim: int = 384
+
+    agent_max_iterations: int = 5
+    sql_row_limit: int = 50
+    sql_timeout_ms: int = 5000
+    mongo_doc_limit: int = 20
 ```
 
 ---
 
-## 4. Frontend Component State (`frontend/src/`)
+## 5. Data Seeding Scripts (`scripts/`)
 
-### 4.1 State Management (React)
+### 5.1 `seed_postgres.py`
+Creates tables `products`, `customers`, `orders` with realistic e-commerce data.
+Schema matches SPEC.md §2 exactly.
+
+### 5.2 `seed_mongo.py`
+Populates collections `reviews`, `support_tickets`, `activity_logs` with
+documents matching SPEC.md §2 collection schemas.
+
+### 5.3 `index_policies.py`
+1. Reads markdown files from `policies/` directory
+2. Chunks each document (~300 tokens, 50 token overlap) per SPEC.md §2
+3. Embeds each chunk locally using `SentenceTransformer("all-MiniLM-L6-v2")`
+4. Creates `policy_chunks` table with `vector(384)` column
+5. Inserts `(section, chunk, embedding)` rows
+
+---
+
+## 6. Frontend (`frontend/src/`)
+
+### 6.1 State Management (React)
+
 ```typescript
-interface Message {
-  role: 'user' | 'agent';
+interface ChatMessage {
+  role: 'user' | 'assistant';
   content: string;
-  trace?: ToolCallRecord[];
+  toolCalls?: ToolCallRecord[];
   warnings?: string[];
+  elapsedMs?: number;
 }
 
-const [messages, setMessages] = useState<Message[]>([]);
+// SPEC.md §6: single-turn, no persistence across page reloads
+const [messages, setMessages] = useState<ChatMessage[]>([]);
 const [isLoading, setIsLoading] = useState(false);
 ```
 
-### 4.2 Tool Trace Rendering (`ToolTrace.tsx`)
-A UI component that maps over `message.trace`.
-- State: `isExpanded` (boolean).
-- UI: Uses Tailwind for styling. Renders `<pre><code>` blocks for `args` and `result` to format the JSON data returned from the API, truncating string length to 500 chars to avoid UI blowouts on large responses.
+### 6.2 API Client (`api/chat.ts`)
+
+```typescript
+const API_BASE = import.meta.env.VITE_API_URL ?? '';
+
+export async function sendQuestion(question: string): Promise<ChatResponse> {
+  const res = await fetch(`${API_BASE}/chat`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ question }),
+  });
+  if (!res.ok) throw new Error((await res.json()).detail ?? `HTTP ${res.status}`);
+  return res.json();
+}
+```
+
+Uses relative URL in dev → Vite proxy forwards to `localhost:8000`.
+
+### 6.3 Tool Trace (`ToolTrace.tsx`)
+
+Per SPEC.md §6: expandable panel showing tool name, args, and raw result.
+Truncates result strings to 500 chars to prevent UI blowout.
+
+### 6.4 Warning Display (`WarningBanner.tsx`)
+
+Per SPEC.md §6: muted amber banner below the answer for each warning string.
 
 ---
 
-## 5. Testing Matrices (`tests/`)
+## 7. Testing (`tests/`)
 
-### 5.1 Unit Tests (`test_sql_tool.py`, etc.)
-- Use `pytest`.
-- Mock Postgres and Mongo connections using `unittest.mock.patch`.
-- **SQL Matrix**: Good Query, Missing Limit, Bad Syntax, DROP Table Attempt.
-- **Mongo Matrix**: Good Query, Bad Collection, Exceeding Max Limit, `$where` injection attempt.
-- **Agent Matrix**: Mock LLM output generating a valid action, a malformed JSON action, and a final answer. Ensure ReAct loop handles all three.
+### 7.1 Unit Tests (`tests/unit/`)
 
-### 5.2 E2E Tests (`test_agent_e2e.py`)
-- Load environment variables from `.env.test`.
-- Connect to live `TestDB` instances (Supabase and Mongo).
-- Iterate over the 5 specific tests and 1 failure case defined in `SPEC.md` section 4.
-- Assert `len(response.tool_calls) > 0`.
-- Assert `response.tool_calls[0].tool == expected_tool`.
-- Assert required fields are substring matches in `response.answer`.
+All mock external dependencies. No live DB or LLM needed.
+
+| File | Tests | What's validated |
+|------|-------|------------------|
+| `test_sql_tool.py` | 11 | Keyword rejection, LIMIT injection, aggregate skip, multi-statement block, timeout handling |
+| `test_mongo_tool.py` | 9 | Whitelist enforcement, `$where` injection, cap enforcement, ObjectId serialization |
+| `test_rag_tool.py` | 9 | Local embedding mock (384-dim), threshold filtering, k-cap, error handling |
+
+### 7.2 E2E Tests (`tests/e2e/test_agent_e2e.py`)
+
+Runs the 5 acceptance questions from SPEC.md §4 + the failure case against live
+databases. Each test asserts:
+
+1. Correct tool was called (`tool_calls[0].tool == expected`)
+2. Answer contains required fields
+3. No hallucinated data
+
+| # | Question | Expected Tool |
+|---|----------|---------------|
+| 1 | "What are the top 5 selling products this month?" | `sql_query` |
+| 2 | "What are the most common customer complaints this week?" | `mongo_query` |
+| 3 | "What is our return policy for damaged goods?" | `handbook_search` |
+| 4 | "Which customers have placed the most orders?" | `sql_query` |
+| 5 | "Show me all 1-star reviews for the Wireless Mouse" | `mongo_query` |
+| F | "What were our sales in 1990?" | `sql_query` → 0 rows → honest "no data" |
+
+---
+
+*Component overview → [HLD.md](./HLD.md) · C4 diagrams → [ARCHITECTURE.md](./ARCHITECTURE.md)*

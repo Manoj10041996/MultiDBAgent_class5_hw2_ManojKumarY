@@ -4,8 +4,9 @@ rag_tool.py — Semantic vector search over StockPulse policy documents.
 Embeddings: SentenceTransformers all-MiniLM-L6-v2 (local, 384-dim, no API key).
 Vector store: Postgres + pgvector extension (policy_chunks table).
 
-The SentenceTransformer model is loaded once at module import time (singleton).
-It runs entirely locally — no network call, no API key required for embeddings.
+Model loading is lazy so API startup doesn't fail if the embedding model is not
+yet cached or network is unavailable. In that case, handbook_search returns a
+SEARCH ERROR instead of crashing the service.
 """
 
 import json
@@ -18,10 +19,27 @@ from sentence_transformers import SentenceTransformer
 from backend.config import settings
 
 # ---------------------------------------------------------------------------
-# Embedding model — loaded once at startup (local, CPU-friendly)
+# Embedding model — lazy singleton (loaded on first use)
 # ---------------------------------------------------------------------------
 
-_embedding_model = SentenceTransformer(settings.embedding_model_name)
+_embedding_model: SentenceTransformer | None = None
+
+
+def _get_embedding_model() -> SentenceTransformer:
+    """Load embedding model once, preferring local cache before network."""
+    global _embedding_model
+    if _embedding_model is not None:
+        return _embedding_model
+
+    try:
+        _embedding_model = SentenceTransformer(
+            settings.embedding_model_name,
+            local_files_only=True,
+        )
+    except Exception:
+        _embedding_model = SentenceTransformer(settings.embedding_model_name)
+
+    return _embedding_model
 
 
 # ---------------------------------------------------------------------------
@@ -33,7 +51,8 @@ def _embed(text: str) -> list[float]:
     Embed a text string using the local SentenceTransformer model.
     Returns a list of floats (384-dim for all-MiniLM-L6-v2).
     """
-    embedding = _embedding_model.encode(text, normalize_embeddings=True)
+    model = _get_embedding_model()
+    embedding = model.encode(text, normalize_embeddings=True)
     return embedding.tolist()
 
 
