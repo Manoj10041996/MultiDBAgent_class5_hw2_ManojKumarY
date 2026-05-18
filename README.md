@@ -3,7 +3,7 @@
 > A multi-database conversational AI agent for e-commerce store operations. Ask a natural-language question — get a grounded answer with full tool-call receipts.
 
 **Domain:** E-commerce operations (inventory, orders, customer support, store policies)  
-**Stack:** FastAPI · LangChain v1 ReAct · OpenAI GPT-4o-mini · Supabase Postgres + pgvector · MongoDB Atlas · Vite + React + TypeScript
+**Stack:** FastAPI · LangChain v1 ReAct · Groq (`openai/gpt-oss-120b`) · SentenceTransformers (`all-MiniLM-L6-v2`, local) · Supabase Postgres + pgvector · MongoDB Atlas · Vite + React + TypeScript
 
 ---
 
@@ -30,7 +30,7 @@ See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for full C4 diagrams.
 - Python 3.12+, `uv` package manager
 - Docker & Docker Compose
 - Node.js 20+ (for the frontend)
-- An OpenAI API key
+- A Groq API key (get one free at console.groq.com)
 
 ### 1. Clone & configure environment
 
@@ -40,10 +40,11 @@ cd MultiDBAgent_class5_hw2_ManojKumarY
 
 cp .env.example .env
 # Edit .env and fill in your keys:
-#   OPENAI_API_KEY=sk-...
+#   GROQ_API_KEY=gsk_...
 #   POSTGRES_URL=postgresql://stockpulse:stockpulse_dev@localhost:5432/stockpulse
 #   MONGO_URL=mongodb://stockpulse:stockpulse_dev@localhost:27017/stockpulse?authSource=admin
 #   MONGO_DB=stockpulse
+# Note: No API key needed for embeddings — all-MiniLM-L6-v2 runs locally
 ```
 
 ### 2. Start the databases
@@ -136,8 +137,13 @@ uv run pytest --cov=backend --cov-report=term-missing
 ### Domain: E-commerce Operations
 Airlines have been done in class. E-commerce gives a natural three-way split: transactional data (Postgres), customer sentiment (MongoDB), and policy documents (RAG). Every store manager can immediately relate to the demo questions.
 
-### Model: GPT-4o-mini (default)
-Fast, cheap, and accurate enough for tool-calling at temperature=0. If routing accuracy falls below acceptable in testing, the model can be swapped to `gpt-4o` by changing `LLM_MODEL` in `.env` — no code change required.
+### LLM: Groq API (`openai/gpt-oss-120b`)
+Groq's inference is significantly faster than OpenAI for single-turn agent loops — sub-second first-token latency. The `openai/gpt-oss-120b` model provides strong instruction-following for the ReAct format. Swappable via `LLM_MODEL` in `.env` — no code change required.
+
+### Embeddings: SentenceTransformers `all-MiniLM-L6-v2` (local)
+Running embeddings locally eliminates a second API dependency, removes per-embedding cost, and reduces latency. The `all-MiniLM-L6-v2` model is 90 MB, CPU-friendly, and produces competitive 384-dim embeddings for policy retrieval. The tradeoff vs. OpenAI `text-embedding-3-small` is slightly lower recall on very long documents — acceptable for our 3-policy corpus.
+
+**Important**: because `all-MiniLM-L6-v2` produces 384-dim vectors (not 1536), the `policy_chunks` table uses `vector(384)`. If you switch embedding models, re-run `scripts/index_policies.py` after updating the DDL dimension.
 
 ### Postgres + pgvector (not a separate vector DB)
 For this scale (< 100 policy chunks), running pgvector as an extension on the same Supabase Postgres instance eliminates an entire third cloud dependency. The `policy_chunks` table lives alongside `products` and `orders`. One connection pool, one backup policy, one set of credentials.
@@ -168,7 +174,7 @@ Reviews, support tickets, and activity logs are naturally document-shaped — va
 
 ## What I Would Change With Another Week
 
-1. **Cache embeddings for repeat queries.** I noticed the agent embeds the same RAG query twice per session (once during reasoning, once during the answer synthesis). Adding a simple LRU cache keyed on the query string would halve the OpenAI embedding cost and latency for repeat questions.
+1. **Cache embeddings for repeat queries.** Because embeddings run locally with SentenceTransformers, the only cost is CPU time. Adding a simple `functools.lru_cache` keyed on the query string would skip re-encoding identical questions, which matters for repeated policy lookups across multiple agent iterations.
 
 2. **Add a fourth tool: `order_status_lookup`.** A dedicated tool that takes an `order_id` and returns its full lifecycle (created → shipped → delivered) would handle the most common support ticket pattern — "where is my order?" — without the agent needing to write a multi-join SQL query.
 
@@ -182,11 +188,12 @@ Reviews, support tickets, and activity logs are naturally document-shaped — va
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `OPENAI_API_KEY` | ✅ | — | OpenAI API key |
+| `GROQ_API_KEY` | ✅ | — | Groq API key |
 | `POSTGRES_URL` | ✅ | — | Full Postgres connection string |
 | `MONGO_URL` | ✅ | — | MongoDB connection string |
 | `MONGO_DB` | ✅ | `stockpulse` | MongoDB database name |
-| `LLM_MODEL` | ❌ | `gpt-4o-mini` | LangChain LLM model name |
+| `LLM_MODEL` | ❌ | `openai/gpt-oss-120b` | Groq model name |
+| `EMBEDDING_MODEL_NAME` | ❌ | `all-MiniLM-L6-v2` | Local SentenceTransformer model |
 | `AGENT_MAX_ITERATIONS` | ❌ | `5` | Max ReAct loop iterations |
 | `SQL_ROW_LIMIT` | ❌ | `50` | Auto-injected LIMIT |
 | `SQL_TIMEOUT_MS` | ❌ | `5000` | Postgres statement timeout |

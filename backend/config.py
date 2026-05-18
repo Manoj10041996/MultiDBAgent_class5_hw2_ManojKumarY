@@ -1,7 +1,8 @@
 """
 config.py — Pydantic Settings for StockPulse Agent.
-All configuration is loaded from environment variables / .env file.
-No defaults contain real secrets. See .env.example for required keys.
+
+LLM:        Groq API (openai/gpt-oss-120b)
+Embeddings: SentenceTransformers all-MiniLM-L6-v2 (local, no API key needed)
 """
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -14,12 +15,15 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    # --- OpenAI ---
-    openai_api_key: str
+    # --- Groq API (LLM) ---
+    groq_api_key: str
 
     # --- LLM ---
-    llm_model: str = "gpt-4o-mini"
-    embedding_model: str = "text-embedding-3-small"
+    llm_model: str = "openai/gpt-oss-120b"
+
+    # --- Embeddings (local SentenceTransformer — no API key needed) ---
+    embedding_model_name: str = "all-MiniLM-L6-v2"
+    embedding_dim: int = 384   # all-MiniLM-L6-v2 produces 384-dim vectors
 
     # --- Agent ---
     agent_max_iterations: int = 5
@@ -28,7 +32,7 @@ class Settings(BaseSettings):
     postgres_url: str  # e.g. postgresql://user:pass@host:5432/dbname
 
     # --- MongoDB ---
-    mongo_url: str       # e.g. mongodb+srv://user:pass@cluster.mongodb.net/
+    mongo_url: str        # e.g. mongodb+srv://user:pass@cluster.mongodb.net/
     mongo_db: str = "stockpulse"
 
     # --- Tool limits ---

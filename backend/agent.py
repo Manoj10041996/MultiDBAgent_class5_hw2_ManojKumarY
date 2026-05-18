@@ -1,22 +1,16 @@
 """
-agent.py — LangChain v1 ReAct agent factory for StockPulse.
+agent.py — LangChain v1 ReAct agent using Groq API.
 
-The agent is the orchestrator. It receives a natural-language question,
-decides which tool(s) to call, observes the results, and synthesises a
-final grounded answer. It NEVER reads from databases directly.
+LLM:   Groq (openai/gpt-oss-120b) via langchain-groq ChatGroq
+Tools: sql_query, mongo_query, handbook_search
 
-Key design decisions:
-  - temperature=0 for deterministic, grounded tool-calling behaviour.
-  - return_intermediate_steps=True so the /chat endpoint can extract the
-    full tool-call trace for the frontend.
-  - handle_parsing_errors=True prevents LLM formatting mistakes from
-    crashing the agent loop.
-  - max_iterations=settings.agent_max_iterations (default 5).
+The agent NEVER reads from databases directly.
+Every data access goes through a typed, sandboxed tool.
 """
 
 from langchain.agents import AgentExecutor, create_react_agent
 from langchain.prompts import PromptTemplate
-from langchain_openai import ChatOpenAI
+from langchain_groq import ChatGroq
 
 from backend.config import settings
 from backend.tools.mongo_tool import mongo_query
@@ -24,7 +18,7 @@ from backend.tools.rag_tool import handbook_search
 from backend.tools.sql_tool import sql_query
 
 # ---------------------------------------------------------------------------
-# System prompt — defines routing rules and hard constraints
+# System prompt — routing rules and hard constraints (from SPEC.md §3)
 # ---------------------------------------------------------------------------
 
 SYSTEM_PROMPT = """You are the StockPulse Store Intelligence Agent — an internal tool \
@@ -77,13 +71,13 @@ _TOOLS = [sql_query, mongo_query, handbook_search]
 
 def build_agent_executor() -> AgentExecutor:
     """
-    Constructs and returns a configured LangChain AgentExecutor.
-    Called once at startup and cached — do not call per-request.
+    Constructs and returns a configured LangChain AgentExecutor backed by Groq.
+    Called once at startup — module-level singleton.
     """
-    llm = ChatOpenAI(
+    llm = ChatGroq(
         model=settings.llm_model,
         temperature=0,
-        api_key=settings.openai_api_key,
+        groq_api_key=settings.groq_api_key,
     )
 
     prompt = PromptTemplate.from_template(SYSTEM_PROMPT)
@@ -97,7 +91,7 @@ def build_agent_executor() -> AgentExecutor:
         max_iterations=settings.agent_max_iterations,
         return_intermediate_steps=True,   # Required: powers the tool-trace UI
         handle_parsing_errors=True,        # Prevents LLM formatting mistakes from crashing
-        verbose=True,                      # Logs reasoning to stdout — useful during dev
+        verbose=True,
     )
 
 
